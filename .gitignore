@@ -1,0 +1,36 @@
+# Environment Variables
+.env
+
+# Pre-compiled or cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Video Pipeline Temp Files
+raw.mp4
+rough.mp4
+temp_audio.wav
+cap.srt
+subtitles.srt
+
+# Output Video
+output/
+merged.mp4
+final_video.mp4
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Project Database
+slicer.db
+
+# External Dependencies & Binaries
+ffmpeg-master-latest-win64-gpl-shared/
+
+# Personal / Discussion files
+别人的经验.txt
+讨论.md
+讨论1.md
+README_zh.md
+error.txt
