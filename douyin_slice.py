@@ -108,22 +108,55 @@ def _upload_to_public(audio_path):
     """依次尝试多个免费临时文件托管，返回公网 URL；全部失败返回 None"""
     fname = os.path.basename(audio_path)
 
-    # litterbox.catbox.moe（1小时有效）
-    try:
-        with open(audio_path, 'rb') as f:
-            resp = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": "1h"},
-                files={"fileToUpload": (fname, f, "audio/wav")},
-                timeout=60
-            )
-        if resp.status_code == 200 and resp.text.startswith("https://"):
-            url = resp.text.strip()
-            print(f"✅ 音频已上传(litterbox)，URL: {url}")
-            return url
-        print(f"⚠️  litterbox 失败({resp.status_code}): {resp.text[:100]}")
-    except Exception as e:
-        print(f"⚠️  litterbox 异常: {e}")
+    # 尝试多个临时文件托管服务
+    services = [
+        # litterbox.catbox.moe（1小时有效）
+        {
+            "name": "litterbox",
+            "url": "https://litterbox.catbox.moe/resources/internals/api.php",
+            "data": {"reqtype": "fileupload", "time": "1h"},
+            "files": lambda f: {"fileToUpload": (fname, f, "audio/wav")}
+        },
+        # 尝试另一个临时文件托管服务
+        {
+            "name": "tmpfiles",
+            "url": "https://tmpfiles.org/api/v1/upload",
+            "data": {},
+            "files": lambda f: {"file": (fname, f, "audio/wav")}
+        }
+    ]
+
+    for service in services:
+        try:
+            print(f"尝试上传到 {service['name']}...")
+            with open(audio_path, 'rb') as f:
+                resp = requests.post(
+                    service["url"],
+                    data=service["data"],
+                    files=service["files"](f),
+                    timeout=60
+                )
+            
+            # 处理不同服务的响应格式
+            if service["name"] == "litterbox":
+                if resp.status_code == 200 and resp.text.startswith("https://"):
+                    url = resp.text.strip()
+                    print(f"✅ 音频已上传({service['name']})，URL: {url}")
+                    return url
+                print(f"⚠️  {service['name']} 失败({resp.status_code}): {resp.text[:100]}")
+            elif service["name"] == "tmpfiles":
+                if resp.status_code == 200:
+                    try:
+                        result = resp.json()
+                        if result.get("success") and result.get("data", {}).get("url"):
+                            url = result["data"]["url"]
+                            print(f"✅ 音频已上传({service['name']})，URL: {url}")
+                            return url
+                    except:
+                        pass
+                    print(f"⚠️  {service['name']} 失败: 响应格式不正确")
+        except Exception as e:
+            print(f"⚠️  {service['name']} 异常: {e}")
 
     print("❌ 所有公网上传均失败")
     return None
@@ -159,36 +192,75 @@ def transcribe_audio(audio_path="temp_audio.wav"):
 
     # 轮询等待结果
     import time
-    for _ in range(60):
-        time.sleep(3)
-        poll_resp = requests.get(
-            f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
-            headers={"Authorization": f"Bearer {get_api_key()}"}
-        )
-        status = poll_resp.json().get("output", {}).get("task_status")
-        if status == "SUCCEEDED":
-            break
-        elif status == "FAILED":
-            print(f"❌ 转录任务失败: {poll_resp.text}")
-            return None
-        print(f"   状态: {status}...")
+    max_retries = 60  # 调整为60次，每次5秒，总共5分钟
+    retry_count = 0
+    while retry_count < max_retries:
+        time.sleep(5)  # 增加每次等待时间到5秒
+        retry_count += 1
+        try:
+            poll_resp = requests.get(
+                f"https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}",
+                headers={"Authorization": f"Bearer {get_api_key()}"},
+                timeout=15  # 增加超时设置
+            )
+            if poll_resp.status_code != 200:
+                print(f"⚠️  轮询请求失败，状态码: {poll_resp.status_code}")
+                print(f"   响应内容: {poll_resp.text[:200]}")
+                continue
+            
+            # 打印完整的响应内容以便调试
+            print(f"   轮询响应: {poll_resp.text[:500]}")
+            
+            # 解析响应
+            try:
+                resp_json = poll_resp.json()
+                status = resp_json.get("output", {}).get("task_status")
+                print(f"   任务状态: {status}")
+                
+                if status == "SUCCEEDED":
+                    print(f"✅ 转录任务成功完成，共等待 {retry_count*5} 秒")
+                    break
+                elif status == "FAILED":
+                    error_msg = resp_json.get("output", {}).get("error", {}).get("message", "未知错误")
+                    print(f"❌ 转录任务失败: {error_msg}")
+                    print(f"   完整错误信息: {poll_resp.text}")
+                    return None
+                print(f"   状态: {status}... (等待 {retry_count*5} 秒)")
+            except json.JSONDecodeError as e:
+                print(f"⚠️  响应解析失败: {e}")
+                print(f"   响应内容: {poll_resp.text[:200]}")
+                continue
+        except Exception as e:
+            print(f"⚠️  轮询过程中发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            # 继续轮询
     else:
         print("❌ 转录超时")
+        print(f"   任务ID: {task_id}")
+        print("   请检查阿里云百炼服务状态或尝试使用其他视频")
         return None
 
     # 4. 解析结果：先拿 transcription_url，再 fetch 详细 JSON
-    results = poll_resp.json().get("output", {}).get("results", [])
-    if not results:
-        print(f"⚠️  转录结果为空: {poll_resp.text[:300]}")
-        return None
+    try:
+        results = poll_resp.json().get("output", {}).get("results", [])
+        if not results:
+            print(f"⚠️  转录结果为空: {poll_resp.text[:300]}")
+            return None
 
-    transcription_url = results[0].get("transcription_url")
-    if not transcription_url:
-        print(f"⚠️  未找到 transcription_url，原始结果: {results[0]}")
-        return None
+        transcription_url = results[0].get("transcription_url")
+        if not transcription_url:
+            print(f"⚠️  未找到 transcription_url，原始结果: {results[0]}")
+            return None
 
-    print(f"📄 获取转录详情: {transcription_url}")
-    detail = requests.get(transcription_url, timeout=30).json()
+        print(f"📄 获取转录详情: {transcription_url}")
+        detail_resp = requests.get(transcription_url, timeout=30)
+        detail = detail_resp.json()
+    except Exception as e:
+        print(f"❌ 解析转录结果失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
     # 结构: transcripts[0].sentences[].{begin_time, end_time, text}
     sentences = detail.get("transcripts", [{}])[0].get("sentences", [])
